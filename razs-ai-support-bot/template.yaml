@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Raz's AI Customer Support Bot
+  API Gateway -> Orchestrator Lambda -> (DynamoDB + Bedrock) -> Validator Lambda -> response
+  CloudWatch + SNS handle monitoring and alerting.
+
+Globals:
+  Function:
+    Timeout: 15
+    MemorySize: 256
+    Runtime: python3.12
+
+Parameters:
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-3-5-haiku-20241022-v1:0
+    Description: Bedrock model ID used to generate support responses.
+  AlertEmail:
+    Type: String
+    Description: Email address to receive CloudWatch alarm notifications via SNS.
+
+Resources:
+
+  # ---------- Storage ----------
+  ConversationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ---------- Messaging / Alerts ----------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: driftly-bot-alerts
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ---------- API ----------
+  SupportApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Cors:
+        AllowMethods: "'POST, OPTIONS'"
+        AllowHeaders: "'Content-Type'"
+        AllowOrigin: "'*'"
+
+  # ---------- Shared layer ----------
+  # Business context (persona, plan info, escalation rules) is shared code,
+  # not duplicated logic, so it lives in one place both functions pull from.
+  SharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: driftly-shared
+      ContentUri: src/shared/
+      CompatibleRuntimes:
+        - python3.12
+      RetentionPolicy: Delete
+
+  # ---------- Orchestrator Lambda ----------
+  # Receives the chat request, loads conversation history, builds the prompt,
+  # calls Bedrock, then invokes the Validator function before returning.
+  OrchestratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/orchestrator/
+      Handler: app.handler
+      Layers:
+        - !Ref SharedLayer
+      Environment:
+        Variables:
+          CONVERSATION_TABLE: !Ref ConversationTable
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          VALIDATOR_FUNCTION_NAME: !Ref ValidatorFunction
+      Events:
+        ChatPost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SupportApi
+            Path: /chat
+            Method: post
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConversationTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !GetAtt ValidatorFunction.Arn
+
+  # ---------- Validator Lambda ----------
+  # Checks the Bedrock response against business rules, formats it for the
+  # brand's voice, and flags anything that needs a human agent.
+  ValidatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/validator/
+      Handler: app.handler
+      Layers:
+        - !Ref SharedLayer
+
+  # ---------- Monitoring ----------
+  OrchestratorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: driftly-orchestrator-errors
+      AlarmDescription: Fires when the orchestrator Lambda throws errors.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OrchestratorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  OrchestratorLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: driftly-orchestrator-latency
+      AlarmDescription: Fires when p95 duration climbs, usually a sign Bedrock or DynamoDB is slow.
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      ExtendedStatistic: p95
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OrchestratorFunction
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 8000
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+Outputs:
+  ChatEndpoint:
+    Description: POST endpoint for the chat widget
+    Value: !Sub "https://${SupportApi}.execute-api.${AWS::Region}.amazonaws.com/prod/chat"
+  ConversationTableName:
+    Value: !Ref ConversationTable
+  AlertTopicArn:
+    Value: !Ref AlertTopic
